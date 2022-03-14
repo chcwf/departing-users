@@ -1,0 +1,286 @@
+#Script will Disable a user that has been placed in the Disabled Accounts OU, strips them of their AD group memberships, sends an email about it, check to see what keycards they hold and emails security, checks to see if they own any mobile devices and emails about that
+#also parses the graveyard folder for files older than 30 days and deletes them
+
+$DisabledAccountOU = "OU=Disabled Accounts,DC=yourdomain,DC=local"
+$EmailSMTPServer = '172.31.0.10'
+$EmailFrom = 'powershell@yourdomain.com'
+$EmailNoticeTo = 'depart@yourdomain.com'
+$EmailNoticeToDepartments = 'departments@yourdomain.com'
+$EmailTicketTo = 'help.desk@yourdomain.com'
+$EmailNoticeSubject = 'Newly Disabled Accounts - ' + (Get-Date -Format "MM/dd/yyyy HH:mm")
+$EmailKeycardSubject = 'Keycard Disable Request - ' + (Get-Date -Format "MM/dd/yyyy HH:mm")
+$EnabledAccounts = Get-ADUser -SearchBase $DisabledAccountOU -Filter{Enabled -eq $True}
+
+
+
+foreach ($Account in $EnabledAccounts)
+
+{
+ $manager = Get-ADUser -identity $Account -Properties Manager | select @{n="ManagerName";e={get-aduser $_.manager | select -ExpandProperty name}}
+ $department = get-aduser -Identity $Account -Properties Department | Select Department
+ $TempName = $Account.Name
+ $TempUPN = $Account.UserPrincipalName
+ $TempUDN = $Account.DistinguishedName
+ $TempSAM = $Account.SamAccountName
+ $EmailTicketSubject = "Mobile Device Tracking - $TempName"
+ $copyfailure = 0
+ #Disables the User's Account
+ Write-Host "Disabling account $TempUPN."
+ Disable-ADAccount -Identity $Account
+
+
+ #Finds out what the user's keycards are
+ $keycards = Get-ADUser -Identity $TempSam -Property Fax | Select-Object Fax
+
+ #Finds out what groups they are in and pulls that to a variable, then removes them from all groups except DomainUsers
+ $TempADGroup = Get-ADPrincipalGroupMembership -Identity $Account | Where-Object -Property Name -NE -Value 'Domain Users' | Select -ExpandProperty Name
+ Get-ADPrincipalGroupMembership -Identity $Account | Where-Object -Property Name -NE -Value 'Domain Users' | Remove-ADGroupMember -Members $Account -Confirm:$false
+
+ #Finds all computers that are "MangedBy" the user
+ $TempComp = Get-ADComputer -Filter "ManagedBy -eq '$TempUDN'" | select -ExpandProperty Name
+
+ #If the user has any computers it emails a ticket to the IT department, if they don't have any it skips the ticket process and edits the notification email that they have no machines.
+ $EmailTicketBody = "The following user was in control of a mobile device:`r`nUser Name: $TempName`r`nUser ID: $TempUPN`r`r`nDevices in question including the following:`r`n$TempComp`r`nPlease track them down and make sure they made it into the hands of IT or a manager"
+ if ($TempComp) { Send-MailMessage -From $EmailFrom -To $EmailTicketTo -Subject $EmailTicketSubject -Body $EmailTicketBody -SmtpServer $EmailSMTPServer  }
+ if (!$TempComp) { $TempComp = "NONE FOUND" }
+
+ #Sends out general notifcation that a user has been disabled
+ $EmailBody = "Windows Logon has been disabled for the following account:`r`nUser Name: $TempName`r`nUser ID: $TempUPN`r`nDirect Supervisor: $manager`r`nDepartment: $department`r`r`nThe user was a part of the following ActiveDirectory groups:`r`n$TempADGroup`r`r`nHR/Managers - The user had the following mobile devices assigned to them:`r`n$TempComp`r`nPlease collect the devices if any are present and deliver to the IT Department`r`r`nEMR Team- Please do all employee offboard processing regarding their Intergy Task and account.`r`r`nHR/Managers - The user was found to be in possession of the following keycards:$keycards - Please collect from the user during your exit interview."
+ Send-MailMessage -From $EmailFrom -To $EmailNoticeTo -Subject $EmailNoticeSubject -Body $EmailBody -SmtpServer $EmailSMTPServer
+
+ #Sends out a ticket to have their keycard revoked
+ $EmailBody = "All keycards need to be disabled for the following user:`r`nUser Name: $TempName`r`nUser ID: $TempUPN`r`n$keycards"
+ Send-MailMessage -From $EmailFrom -To $EmailTicketTo -Subject $EmailKeycardSubject -Body $EmailBody -SmtpServer $EmailSMTPServer
+
+ #Creates a folder in the graveyard for the user
+ New-Item -Path "\\srv-fileserver\departments$\Information Technology\==Graveyard==" -Name $TempName -ItemType directory
+ New-Item -Path "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName" -Name u-drive -ItemType directory
+ New-Item -Path "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName" -Name roaming-profile -ItemType directory
+ New-Item -Path "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName" -Name scan-drive -ItemType directory
+ New-Item -Path "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName\roaming-profile" -Name desktop.v6 -ItemType directory
+ New-Item -Path "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName\roaming-profile" -Name desktop.v2 -ItemType directory
+ New-Item -Path "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName\roaming-profile" -Name $TempSAM -ItemType directory
+
+ #########################Prepares the RDS Roaming Profile information for copy/delete##################################
+
+ #Strips all permissions from the folder "USERNAME"
+$directory = "\\srv-fileserver\userroamingprofiles$\$TempSAM"
+$subfolders = Get-ChildItem $directory
+
+#Take ownwership of all files/folders (sets them as owned by local administrators)
+foreach ($subfolders in $directory) 
+{
+takeown /r /a /f $subfolders /d Y
+}
+
+#Disables inerentance for all files/folders
+foreach ($subfolders in $directory) 
+{
+$acl = Get-ACL -Path $subfolders
+$acl.SetAccessRuleProtection($True, $True)
+Set-Acl -Path $subfolders -AclObject $acl
+}
+
+#########################################################################################
+
+#Strips all permissions from the folder "USERNAME.V2"
+$directoryv2 = "\\srv-fileserver\userroamingprofiles$\$TempSAM.yourdomain.V2"
+$subfoldersv2 = Get-ChildItem $directoryv2
+
+#Take ownwership of all files/folders (sets them as owned by local administrators)
+foreach ($subfoldersv2 in $directoryv2) 
+{
+takeown /r /a /f $subfoldersv2 /d Y
+}
+
+#Disables inerentance for all files/folders
+foreach ($subfoldersv2 in $directoryv2) 
+{
+$acl = Get-ACL -Path $subfoldersv2
+$acl.SetAccessRuleProtection($True, $True)
+Set-Acl -Path $subfoldersv2 -AclObject $acl
+}
+
+##########################################################################################
+
+
+#Strips all permissions from the folder "USERNAME.V6"
+$directoryv6 = "\\srv-fileserver\userroamingprofiles$\$TempSAM.yourdomain.V6"
+$subfoldersv6 = Get-ChildItem $directoryv6
+
+
+
+#Take ownwership of all files/folders (sets them as owned by local administrators)
+foreach ($subfoldersv6 in $directoryv6) 
+{
+takeown /r /a /f $subfoldersv6 /d Y
+}
+
+#Disables inerentance for all files/folders
+foreach ($subfoldersv6 in $directoryv6) 
+{
+$acl = Get-ACL -Path $subfoldersv6
+$acl.SetAccessRuleProtection($True, $True)
+Set-Acl -Path $subfoldersv6 -AclObject $acl
+}
+
+######################################################################################
+
+
+####Copies the profile folders then deletes the original
+
+
+        #####==username\Downloads#####
+ try
+ {
+ Copy-Item -Path "\\srv-fileserver\userroamingprofiles$\$TempSAM\Downloads\*" -Destination "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName\roaming-profile\$TempSAM" -Recurse -ErrorAction Stop
+ Remove-Item -Path "\\srv-fileserver\userroamingprofiles$\$TempSAM" -Recurse -Force
+ }
+catch
+ {
+$copyfailure = 1
+ }
+
+
+ 
+
+        ####==username.yourdomain.V6\Desktop==###
+try
+{
+Copy-Item -Path "\\srv-fileserver\userroamingprofiles$\$TempSAM.yourdomain.V6\Desktop\*" -Destination "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName\roaming-profile\desktop.v6" -Recurse -ErrorAction Stop
+Remove-Item -Path "\\srv-fileserver\userroamingprofiles$\$TempSAM.yourdomain.V6" -Recurse -Force
+}
+catch
+{
+$copyfailure = 1
+}
+
+        ####==username.yourdomain.V2\Desktop==###
+try
+{
+ Copy-Item -Path "\\srv-fileserver\userroamingprofiles$\$TempSAM.yourdomain.V2\Desktop\*" -Destination "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName\roaming-profile\desktop.v2" -Recurse -ErrorAction Stop
+ Remove-Item -Path "\\srv-fileserver\userroamingprofiles$\$TempSAM.yourdomain.V2" -Recurse -Force
+}
+catch
+{
+$copyfailure = 1
+}
+
+
+ #################### Copy and Removal of Scan Files Drive ###################################
+  #Strips all permissions from the folder "USERNAME"
+$scandirectory = "\\srv-fs-ps\scanned$\Scan-$TempSAM"
+$scansubfolders = Get-ChildItem $scandirectory
+
+#Take ownwership of all files/folders (sets them as owned by local administrators)
+foreach ($scansubfolders in $scandirectory) 
+{
+takeown /r /a /f $scansubfolders /d Y
+}
+
+#Disables inherentance for all files/folders
+foreach ($scansubfolders in $scandirectory) 
+{
+$acl = Get-ACL -Path $scansubfolders
+$acl.SetAccessRuleProtection($True, $True)
+Set-Acl -Path $scansubfolders -AclObject $acl
+}
+
+####Routine to Copy and Delete the scan folder#######
+
+try
+{
+Copy-Item -Path "\\srv-fs-ps\scanned$\Scan-$TempSAM\*" -Destination "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName\scan-drive" -Recurse -ErrorAction Stop
+Remove-Item -Path "\\srv-fs-ps\scanned$\Scan-$TempSAM" -Recurse -Force
+}
+catch
+{
+$copyfailure = 1
+}
+
+
+
+
+ ########### Copy and Removal of U Drive Files #################
+
+  #Strips all permissions from the folder "USERNAME"
+$udrivedirectory = "\\srv-fs-ps\usersudrive$\$TempSAM"
+$udrivesubfolders = Get-ChildItem $udrivedirectory
+
+#Take ownwership of all files/folders (sets them as owned by local administrators)
+foreach ($udrivesubfolders in $udrivedirectory) 
+{
+takeown /r /a /f $udrivesubfolders /d Y
+}
+
+
+#Disables inerentance for all files/folders
+foreach ($udrivesubfolders in $udrivedirectory) 
+{
+$acl = Get-ACL -Path $udrivesubfolders
+$acl.SetAccessRuleProtection($True, $True)
+Set-Acl -Path $udrivesubfolders -AclObject $acl
+}
+
+#### Copy and Delete the U Drive ####
+try
+{
+Copy-Item -Path "\\srv-fs-ps\usersudrive$\$TempSAM\*" -Exclude ('AppData','WINDOWS') -Destination "\\srv-fileserver\departments$\Information Technology\==Graveyard==\$TempName\u-drive" -Recurse -ErrorAction Stop
+Remove-Item -Path "\\srv-fs-ps\usersudrive$\$TempSAM" -Recurse -Force
+}
+catch
+{
+$copyfailure = 1
+}
+
+
+
+######## Removal of RemoteApp Folders #########
+Remove-Item -Path "\\srv-fs-ps\tsprofiles$\$TempSAM.yourdomain.V2" -Recurse -Force
+
+
+
+
+##### Make a ticket if there are any problems with the copying
+
+If ($copyfailure -eq 1)
+{
+$EmailCopyErrorBody = "We had a problem copying the profile files for the disabled user -$TempName. Please investigate the issue manually"
+$EmailCopyErrorSubject = "Disabled User Profile Problem $TempName"
+Send-MailMessage -From $EmailFrom -To $EmailTicketTo -Subject $EmailCopyErrorSubject -Body $EmailCopyErrorBody -SmtpServer $EmailSMTPServer 
+}
+
+
+
+
+ 
+
+
+ 
+ #Disables the computers the user owned
+$DisableComputerList = Get-ADComputer -Filter "ManagedBy -eq '$TempUDN'"
+
+foreach ($DisableComputer in $DisableComputerList)
+  
+{
+  Disable-ADAccount -Identity $DisableComputer
+  Set-ADComputer -Identity $DisableComputer -ManagedBy $null
+  Move-ADObject -Identity $DisableComputer -TargetPath "OU=departed,OU=Laptops - Tablets,OU=Workstations,OU=Computers,OU=CHC Servers and Computers,DC=yourdomain,DC=local"
+}
+
+
+
+
+}
+
+#Script will delete any files in a directory INCLUDING subdirectories older than specified date
+$Path = "\\srv-fileserver\departments$\Information Technology\==Graveyard=="
+$Daysback = "-30"
+$CurrentDate = Get-Date
+$DatetoDelete = $CurrentDate.AddDays($Daysback)
+Get-ChildItem $Path -Recurse | Where-Object { $_.LastWriteTime -lt $DatetoDelete } | Remove-Item -Force -Recurse
+
+
+
+
+
